@@ -3,7 +3,7 @@ app_title = "Frappe Search"
 app_publisher = "rtCamp"
 app_description = "Global search for custom apps"
 app_email = "erp@rtcamp.com"
-app_license = "gpl-3.0"
+app_license = "GNU AFFERO GENERAL PUBLIC LICENSE (v3)"
 
 # Apps
 # ------------------
@@ -241,4 +241,3 @@ app_license = "gpl-3.0"
 # default_log_clearing_doctypes = {
 # 	"Logging DocType Name": 30  # days to retain logs
 # }
-

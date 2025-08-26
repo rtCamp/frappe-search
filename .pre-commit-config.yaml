@@ -1,0 +1,48 @@
+exclude: 'node_modules|.git'
+default_stages: [commit]
+fail_fast: false
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.3.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ".*json$|.*txt$|.*csv|.*md|.*svg"
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-ast
+      - id: check-json
+      - id: check-toml
+      - id: debug-statements
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.2.0
+    hooks:
+      - id: ruff
+        name: "Run ruff import sorter"
+        args: ["--select=I", "--fix"]
+
+      - id: ruff
+        name: "Run ruff linter"
+
+      - id: ruff-format
+        name: "Run ruff formatter"
+
+  - repo: local
+    hooks:
+      - id: clone-local-repo
+        name: clone-local-repo
+        entry: bash -c 'TARGET_DIR=".frappe-semgrep" && [ ! -d "$TARGET_DIR" ] && git clone "https://github.com/frappe/semgrep-rules" "$TARGET_DIR" || true'
+        language: system
+        always_run: true
+
+  - repo: https://github.com/semgrep/pre-commit
+    rev: 'v1.91.0'
+    hooks:
+      - id: semgrep-ci
+        args: ['--config', './.frappe-semgrep/rules', '--config','r/python.lang.correctness','--error', '--skip-unknown-extensions', '--metrics','off']
+
+ci:
+    autoupdate_schedule: weekly
+    skip: []
+    submodules: false
