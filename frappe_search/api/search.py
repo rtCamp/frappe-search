@@ -405,7 +405,7 @@ def get_global_search_results(
     return search_results, load_more
 
 
-# @redis_cache(ttl=180)
+@redis_cache(ttl=180)
 def process_results(start, limit, doctype, allowed_doctypes, text):
     results = search(
         text,
