@@ -405,7 +405,7 @@ def get_global_search_results(
     return search_results, load_more
 
 
-@redis_cache(ttl=180)
+# @redis_cache(ttl=180)
 def process_results(start, limit, doctype, allowed_doctypes, text):
     results = search(
         text,
@@ -418,7 +418,7 @@ def process_results(start, limit, doctype, allowed_doctypes, text):
     processed_results = []
 
     for result in results:
-        if ("||| Name: " not in result.content) or not result.content.startswith(
+        if ("||| Name: " not in result.content) and not result.content.startswith(
             "Name: "
         ):
             result.content = f"Name: {result.name} ||| {result.content}"
@@ -426,6 +426,10 @@ def process_results(start, limit, doctype, allowed_doctypes, text):
 
         fuzzy = fuzzy_search(text, result.content, return_marked_string=True)
         if fuzzy["score"] > 0:
+            if not frappe.db.exists(result.doctype, result.name):
+                continue
+            if not frappe.has_permission(result.doctype, "read", result.name):
+                continue
             result.score = fuzzy["score"]
             result.marked_string = fuzzy["context"]
             result.full_marked_string = fuzzy["marked_string"]
