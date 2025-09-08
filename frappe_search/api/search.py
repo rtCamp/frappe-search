@@ -1,5 +1,6 @@
 import frappe
 from frappe.utils import cint
+from frappe.utils.caching import redis_cache
 
 # Scoring constants
 SEQUENTIAL_BONUS = 40
@@ -316,6 +317,7 @@ def fuzzy_search(keywords="", item="", return_marked_string=False):
 
 
 @frappe.whitelist()
+@redis_cache(ttl=180)
 def search(text, start=0, limit=20, doctype="", allowed_doctypes=[]):
     """Search for given text in __global_search"""
     from frappe.query_builder.functions import Match
@@ -363,10 +365,6 @@ def search(text, start=0, limit=20, doctype="", allowed_doctypes=[]):
             if r.doctype == doctype and r.rank > 0.0:
                 try:
                     meta = frappe.get_meta(r.doctype)
-                    if meta.image_field:
-                        r.image = frappe.db.get_value(
-                            r.doctype, r.name, meta.image_field
-                        )
                     if meta.title_field:
                         r.title = frappe.db.get_value(
                             r.doctype, r.name, meta.title_field
@@ -383,27 +381,51 @@ def search(text, start=0, limit=20, doctype="", allowed_doctypes=[]):
 def get_global_search_results(
     text, start=0, limit=20, doctype="", allowed_doctypes=None
 ):
-    """Main search function with fuzzy matching"""
+    allowed_doctypes_tuple = tuple(allowed_doctypes) if allowed_doctypes else ()
+    second_start = start + limit
+    text_len = len(text)
+    if text_len < 3:
+        return []
     if allowed_doctypes is None:
         allowed_doctypes = []
 
-    global_results = search(
+    search_results = process_results(
+        start, limit, doctype, allowed_doctypes_tuple, text
+    )
+    # Pre-process next set of results to check if "load more" is needed.
+    # Results are cached to prevent redundant searches.
+    secondary_search_results = process_results(
+        second_start, limit, doctype, allowed_doctypes_tuple, text
+    )
+
+    load_more = False
+    if secondary_search_results:
+        load_more = True
+
+    return search_results, load_more
+
+
+@redis_cache(ttl=180)
+def process_results(start, limit, doctype, allowed_doctypes, text):
+    results = search(
         text,
         start=start,
         limit=limit,
         doctype=doctype,
         allowed_doctypes=allowed_doctypes,
     )
+
     processed_results = []
 
-    for result in global_results:
+    for result in results:
         if ("||| Name: " not in result.content) or not result.content.startswith(
             "Name: "
         ):
             result.content = f"Name: {result.name} ||| {result.content}"
+        result.content = result.content.replace("|||", "<br>")
 
         fuzzy = fuzzy_search(text, result.content, return_marked_string=True)
-        if fuzzy["score"] > 40:
+        if fuzzy["score"] > 0:
             result.score = fuzzy["score"]
             result.marked_string = fuzzy["context"]
             result.full_marked_string = fuzzy["marked_string"]
