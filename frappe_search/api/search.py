@@ -378,7 +378,7 @@ def search(text, start=0, limit=20, doctype="", allowed_doctypes=[]):
                     dt,
                     filters={"name": ["in", names]},
                     fields=["name", meta.title_field],
-                    limit_page_length=0,
+                    limit_page_length=1000,
                 )
                 title_cache[dt] = {d.name: d.get(meta.title_field) for d in title_data}
         except Exception:
