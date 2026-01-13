@@ -435,14 +435,23 @@ def process_results(start, limit, doctype, allowed_doctypes, text):
                 dt,
                 filters={"name": ["in", names]},
                 fields=["name"],
-                limit_page_length=0  # Get all matching
+                limit_page_length=None  # Get all matching records
             )
-            valid_docs.update(f"{dt}:{d.name}" for d in existing)
+            # Optimize f-string formatting in generator
+            valid_docs.update(dt + ":" + d.name for d in existing)
         except frappe.PermissionError:
             # User has no access to this doctype at all
             continue
-        except Exception:
-            # Handle cases where doctype might not exist or other errors
+        except (frappe.DoesNotExistError, AttributeError):
+            # Handle cases where doctype might not exist or has attribute issues
+            frappe.clear_messages()
+            continue
+        except Exception as e:
+            # Log unexpected exceptions for debugging
+            frappe.log_error(
+                f"Unexpected error in batch permission check for {dt}: {str(e)}",
+                "Search Batch Permission Error"
+            )
             frappe.clear_messages()
             continue
 
