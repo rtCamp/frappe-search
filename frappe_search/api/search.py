@@ -359,19 +359,38 @@ def search(text, start=0, limit=20, doctype="", allowed_doctypes=[]):
         result = query.run(as_dict=True)
         results.extend(result)
 
-    # Sort results based on allowed_doctype's priority
+    # Group results by doctype for batch title fetching
+    results_by_doctype = {}
+    for r in results:
+        if r.rank > 0.0:
+            if r.doctype not in results_by_doctype:
+                results_by_doctype[r.doctype] = []
+            results_by_doctype[r.doctype].append(r)
+
+    # Batch fetch titles per doctype
+    title_cache = {}  # {doctype: {name: title}}
+    for dt, dt_results in results_by_doctype.items():
+        try:
+            meta = frappe.get_meta(dt)
+            if meta.title_field:
+                names = [r.name for r in dt_results]
+                title_data = frappe.get_all(
+                    dt,
+                    filters={"name": ["in", names]},
+                    fields=["name", meta.title_field],
+                    limit_page_length=1000,
+                )
+                title_cache[dt] = {d.name: d.get(meta.title_field) for d in title_data}
+        except Exception:
+            frappe.clear_messages()
+
+    # Sort results based on allowed_doctype's priority and assign titles
     for doctype in allowed_doctypes:
         for r in results:
             if r.doctype == doctype and r.rank > 0.0:
-                try:
-                    meta = frappe.get_meta(r.doctype)
-                    if meta.title_field:
-                        r.title = frappe.db.get_value(
-                            r.doctype, r.name, meta.title_field
-                        )
-                except Exception:
-                    frappe.clear_messages()
-
+                # Assign title from cache
+                if doctype in title_cache and r.name in title_cache[doctype]:
+                    r.title = title_cache[doctype][r.name]
                 sorted_results.append(r)
 
     return sorted_results
