@@ -1,6 +1,10 @@
 import frappe
-from frappe.utils import cint
+from frappe.utils import cint, escape_html
 from frappe.utils.caching import redis_cache
+
+# Hard ceiling on the row count a caller may ask for. Every returned row costs a
+# document load in the per-row permission check, so the caller must not choose it.
+MAX_SEARCH_LIMIT = 100
 
 # Scoring constants
 SEQUENTIAL_BONUS = 40
@@ -10,7 +14,7 @@ FIRST_LETTER_BONUS = 30
 EXACT_MATCH_BONUS = 100
 
 
-def strict_fuzzy_match(pattern, text):
+def strict_fuzzyx_match(pattern, text):
     """
     Strict fuzzy matching with enhanced scoring
     Returns (matched: bool, score: int, matches: list of indices)
@@ -184,7 +188,7 @@ def find_all_strict_fuzzy_matches(pattern, text):
 
     # If no exact matches, try fuzzy matching
     if not all_matches:
-        matched, score, matches = strict_fuzzy_match(pattern, text)
+        matched, score, matches = strict_fuzzyx_match(pattern, text)
         if matched:
             all_matches.append((matches, score))
 
@@ -192,13 +196,17 @@ def find_all_strict_fuzzy_matches(pattern, text):
 
 
 def highlight_all_occurrences(text, search_terms):
-    """Highlight high-quality matches"""
+    """Highlight high-quality matches.
+
+    Returns an HTML-safe string: the document text is escaped and only the
+    <mark> tags added here are live markup.
+    """
     if not search_terms or not text:
-        return text
+        return escape_html(text or "")
 
     terms = [term.strip() for term in search_terms.split() if term.strip()]
     if not terms:
-        return text
+        return escape_html(text)
 
     highlighted_positions = set()
 
@@ -222,7 +230,9 @@ def highlight_all_occurrences(text, search_terms):
             result += "</mark>"
             in_mark = False
 
-        result += char
+        # escape per character: the match offsets index the *unescaped* string,
+        # so escaping the whole text up front would shift every index
+        result += escape_html(char)
 
     if in_mark:
         result += "</mark>"
@@ -272,10 +282,11 @@ def fuzzy_search(keywords="", item="", return_marked_string=False):
     """Enhanced fuzzy search with scoring"""
     if not keywords or not item:
         if return_marked_string:
+            item = item or ""
             return {
                 "score": 0,
-                "marked_string": item,
-                "context": item[:80] + ("..." if len(item) > 80 else ""),
+                "marked_string": escape_html(item),
+                "context": escape_html(item[:80] + ("..." if len(item) > 80 else "")),
             }
         return 0
 
@@ -302,7 +313,11 @@ def fuzzy_search(keywords="", item="", return_marked_string=False):
 
     if total_score <= 40:
         truncated_item = item[:80] + ("..." if len(item) > 80 else "")
-        return {"score": 0, "marked_string": item, "context": truncated_item}
+        return {
+            "score": 0,
+            "marked_string": escape_html(item),
+            "context": escape_html(truncated_item),
+        }
 
     all_matches = sorted(list(set(all_matches)))
     context = extract_context_around_matches(item, all_matches, context_chars=25)
@@ -316,14 +331,78 @@ def fuzzy_search(keywords="", item="", return_marked_string=False):
     }
 
 
+def normalize_doctypes(value):
+    """Normalise a caller-supplied doctype list into a hashable tuple.
+
+    Accepts a real sequence, a JSON array, or a comma-separated string, because
+    `frappe.form_dict` delivers a different type per transport. The result is a
+    tuple so it stays hashable for `@redis_cache`, which keys on
+    `frozenset(kwargs.items())`.
+    """
+    if not value:
+        return ()
+
+    if isinstance(value, str):
+        try:
+            value = frappe.parse_json(value)
+        except Exception:
+            value = value.split(",")
+        if isinstance(value, str):
+            value = [value]
+
+    if not isinstance(value, list | tuple | set):
+        return ()
+
+    return tuple(str(d).strip() for d in value if str(d).strip())
+
+
+def get_permitted_doctypes(requested=()):
+    """The doctypes this session may search.
+
+    Authorization is the server's decision, never the caller's: the set is the
+    globally-indexed doctypes intersected with the user's own read rights.
+    `requested` may *narrow* that set, it can never widen it.
+    """
+    from frappe.desk.doctype.global_search_settings.global_search_settings import (
+        get_doctypes_for_global_search,
+    )
+
+    permitted = set(get_doctypes_for_global_search()) & set(
+        frappe.get_user().get_can_read()
+    )
+
+    if requested:
+        permitted &= set(requested)
+
+    return tuple(sorted(permitted))
+
+
 @frappe.whitelist()
-@redis_cache(ttl=180)
-def search(text, start=0, limit=20, doctype="", allowed_doctypes=[]):
+def search(text: str, start: int = 0, limit: int = 20, doctype: str = ""):
     """Search for given text in __global_search"""
+    return _search(
+        text,
+        start=max(cint(start), 0),
+        limit=min(max(cint(limit), 1), MAX_SEARCH_LIMIT),
+        doctype=doctype or "",
+    )
+
+
+@redis_cache(ttl=180, user=True)
+def _search(text, start=0, limit=20, doctype="", allowed_doctypes=()):
+    """Cached core of `search`.
+
+    `allowed_doctypes` is an optional *narrowing* filter for in-process callers
+    (see `get_permitted_doctypes`); it is not, and must never become, the source
+    of authorization. Every argument is already normalised and clamped by the
+    caller, so the cache key is always hashable.
+    """
     from frappe.query_builder.functions import Match
 
     results = []
     sorted_results = []
+
+    allowed_doctypes = get_permitted_doctypes(allowed_doctypes)
 
     if not allowed_doctypes or (doctype and doctype not in allowed_doctypes):
         return []
@@ -364,6 +443,11 @@ def search(text, start=0, limit=20, doctype="", allowed_doctypes=[]):
         for r in results:
             if r.doctype == doctype and r.rank > 0.0:
                 try:
+                    # __global_search is read as a raw table, so no permission
+                    # layer applies to the query -- re-check each row here
+                    if not frappe.has_permission(r.doctype, "read", r.name):
+                        continue
+
                     meta = frappe.get_meta(r.doctype)
                     if meta.title_field:
                         r.title = frappe.db.get_value(
@@ -371,6 +455,7 @@ def search(text, start=0, limit=20, doctype="", allowed_doctypes=[]):
                         )
                 except Exception:
                     frappe.clear_messages()
+                    continue
 
                 sorted_results.append(r)
 
@@ -379,15 +464,20 @@ def search(text, start=0, limit=20, doctype="", allowed_doctypes=[]):
 
 @frappe.whitelist()
 def get_global_search_results(
-    text, start=0, limit=20, doctype="", allowed_doctypes=None
+    text: str,
+    start: int = 0,
+    limit: int = 20,
+    doctype: str = "",
+    allowed_doctypes: list | None = None,
 ):
-    allowed_doctypes_tuple = tuple(allowed_doctypes) if allowed_doctypes else ()
+    start = max(cint(start), 0)
+    limit = min(max(cint(limit), 1), MAX_SEARCH_LIMIT)
+    doctype = doctype or ""
+    # a narrowing filter only -- `_search` intersects it with the caller's rights
+    allowed_doctypes_tuple = normalize_doctypes(allowed_doctypes)
     second_start = start + limit
-    text_len = len(text)
-    if text_len < 3:
+    if len(text or "") < 3:
         return []
-    if allowed_doctypes is None:
-        allowed_doctypes = []
 
     search_results = process_results(
         start, limit, doctype, allowed_doctypes_tuple, text
@@ -405,9 +495,8 @@ def get_global_search_results(
     return search_results, load_more
 
 
-@redis_cache(ttl=180)
 def process_results(start, limit, doctype, allowed_doctypes, text):
-    results = search(
+    results = _search(
         text,
         start=start,
         limit=limit,
@@ -418,21 +507,24 @@ def process_results(start, limit, doctype, allowed_doctypes, text):
     processed_results = []
 
     for result in results:
-        if ("||| Name: " not in result.content) and not result.content.startswith(
-            "Name: "
-        ):
-            result.content = f"Name: {result.name} ||| {result.content}"
-        result.content = result.content.replace("|||", "<br>")
+        content = result.content
+        if ("||| Name: " not in content) and not content.startswith("Name: "):
+            content = f"Name: {result.name} ||| {content}"
 
-        fuzzy = fuzzy_search(text, result.content, return_marked_string=True)
+        # `|||` is left in place until after escaping: it survives escape_html
+        # untouched, so the <br> can be substituted into the safe output. Doing
+        # it first would either escape the tag away or let the markup be matched
+        # and split by a <mark>.
+        fuzzy = fuzzy_search(text, content, return_marked_string=True)
         if fuzzy["score"] > 0:
             if not frappe.db.exists(result.doctype, result.name):
                 continue
             if not frappe.has_permission(result.doctype, "read", result.name):
                 continue
             result.score = fuzzy["score"]
-            result.marked_string = fuzzy["context"]
-            result.full_marked_string = fuzzy["marked_string"]
+            result.content = escape_html(content).replace("|||", "<br>")
+            result.marked_string = fuzzy["context"].replace("|||", "<br>")
+            result.full_marked_string = fuzzy["marked_string"].replace("|||", "<br>")
             processed_results.append(result)
 
     return sorted(processed_results, key=lambda x: x.score, reverse=True)
